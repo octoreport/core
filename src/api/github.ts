@@ -1,6 +1,9 @@
 import { DateTime } from 'luxon';
 import { z } from 'zod';
 
+import { ensureOk, request } from './fetcher';
+
+import { GitHubGraphQLError, ValidationError } from '@/errors';
 import {
   PRListResponseSchema,
   PRDetailResponseSchema,
@@ -12,12 +15,12 @@ import {
 import { combinePRData } from '@/transformers';
 import { PRQueryParams, PR, DateRange } from '@/types';
 
-function validateApiResponse<T>(data: unknown, schema: z.ZodSchema<T>): T {
+function validateAPIResponse<T>(data: unknown, schema: z.ZodSchema<T>): T {
   try {
     return schema.parse(data);
   } catch (error) {
     if (error instanceof z.ZodError) {
-      throw new Error(`API response validation failed: ${error.message}`);
+      throw new ValidationError('Validation failed', error.issues, { cause: error });
     }
     throw error;
   }
@@ -39,12 +42,13 @@ export function convertPeriodToUTCISO(period: DateRange): DateRange {
 }
 
 export async function fetchGitHubUserInfo(githubToken: string): Promise<GitHubUserInfo> {
-  const response = await fetch('https://api.github.com/graphql', {
+  const response = await request('https://api.github.com/graphql', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${githubToken}`,
       'Content-Type': 'application/json',
     },
+    timeoutMs: 15000,
     body: JSON.stringify({
       query: `
         {
@@ -57,40 +61,27 @@ export async function fetchGitHubUserInfo(githubToken: string): Promise<GitHubUs
     }),
   });
 
-  if (!response.ok) {
-    throw new Error(`HTTP error! status: ${response.status}`);
-  }
+  await ensureOk(response, { url: 'https://api.github.com/graphql', op: 'fetchGitHubUserInfo' });
 
-  const scopesHeader = response.headers.get('x-oauth-scopes');
-  if (!scopesHeader) {
-    throw new Error('Invalid response structure: missing x-oauth-scopes header');
-  }
-  const scopeList = scopesHeader.split(',').map((scope) => scope.trim());
-
-  const data = await response.json();
-  if (data.errors) {
-    const errorMessage = data.errors[0]?.message || 'GraphQL error occurred';
-    throw new Error(`GraphQL error: ${errorMessage}`);
-  }
-  if (!data.data) {
-    throw new Error('Invalid response structure: missing data field');
-  }
-  if (!data.data.viewer) {
-    throw new Error('Invalid response structure: missing viewer field');
-  }
-
-  try {
-    const validatedUserInfo = GitHubUserInfoSchema.parse({
-      ...data.data.viewer,
-      scopeList,
+  const payload = await response.json();
+  if (Array.isArray(payload?.errors) && payload.errors.length > 0) {
+    throw new GitHubGraphQLError('GitHub GraphQL error', payload.errors, {
+      operationName: 'GetViewer',
     });
-    return validatedUserInfo;
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      throw new Error(`User info validation failed: ${error.message}`);
-    }
-    throw error;
   }
+
+  const scopesHeader = response.headers.get('x-oauth-scopes') || '';
+  const scopeList = scopesHeader
+    ? scopesHeader
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+
+  const viewer = payload?.data?.viewer;
+  const validatedUserInfo = validateAPIResponse({ ...viewer, scopeList }, GitHubUserInfoSchema);
+
+  return validatedUserInfo;
 }
 
 export async function fetchPRListInPeriod(
@@ -126,7 +117,7 @@ Once you’ve completed SSO authorization, run the command again.`,
 
     const rawData = await response.json();
 
-    const validatedData = validateApiResponse(rawData, PRListResponseSchema);
+    const validatedData = validateAPIResponse(rawData, PRListResponseSchema);
 
     if (validatedData.items.length === 0) {
       break;
@@ -208,7 +199,7 @@ export async function fetchPRDetail({
     throw new Error(`GraphQL error: ${rawData.errors[0]?.message || 'Unknown error'}`);
   }
 
-  const validatedData = validateApiResponse(rawData, PRDetailResponseSchema);
+  const validatedData = validateAPIResponse(rawData, PRDetailResponseSchema);
 
   return validatedData.data.repository.pullRequest;
 }
